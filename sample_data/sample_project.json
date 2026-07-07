@@ -1,0 +1,40 @@
+{
+  "project": {
+    "title": "The Great Adventure",
+    "author": "Jane Doe",
+    "narrator": "John Smith",
+    "isbn": "978-0-000-00000-0"
+  },
+  "audio_specs": {
+    "format": "mp3",
+    "bitrate_kbps": 128,
+    "sample_rate_hz": 44100,
+    "channels": 1
+  },
+  "chapters": [
+    {
+      "number": 1,
+      "title": "Opening Credits",
+      "filename": "01_Opening_Credits.mp3",
+      "duration_seconds": 45.0
+    },
+    {
+      "number": 2,
+      "title": "Chapter 1 - The Beginning",
+      "filename": "02_Chapter_01.mp3",
+      "duration_seconds": 1842.5
+    },
+    {
+      "number": 3,
+      "title": "Chapter 2 - The Journey",
+      "filename": "03_Chapter_02.mp3",
+      "duration_seconds": 2104.0
+    },
+    {
+      "number": 4,
+      "title": "End Credits",
+      "filename": "04_End_Credits.mp3",
+      "duration_seconds": 30.0
+    }
+  ]
+}
