@@ -1,0 +1,24 @@
+{
+  "name": "qc-lite",
+  "version": "1.0.0",
+  "description": "Lightweight L2 QC Tool",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:all": "electron-builder --mac --win"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "4.21.2",
+    "exceljs": "4.4.0"
+  },
+  "devDependencies": {
+    "electron": "33.4.5",
+    "electron-builder": "^25.1.0"
+  }
+}

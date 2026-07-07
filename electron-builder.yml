@@ -1,0 +1,56 @@
+appId: com.example.qc-lite
+productName: QC Lite
+copyright: Copyright 2026
+directories:
+  output: dist
+
+# Keep the default file inclusion (package.json, source files, production node_modules)
+# and remove development / test helpers that are not needed at runtime.
+files:
+  - "!test-electron.js"
+  - "!verify_export.js"
+  - "!check-syntax.js"
+  - "!**/*.bat"
+  - "!*.md"
+  - "!package-lock.json"
+  - "!.github/**/*"
+
+# Unpack static directories so the Express server can read them as regular files
+# from the packaged app (asar virtual directories can be tricky for fs.stat/readdir).
+asarUnpack:
+  - ui
+  - report_templates
+
+mac:
+  category: public.app-category.utilities
+  target:
+    - target: dmg
+      arch: universal
+    - target: zip
+      arch: universal
+  # Minimum macOS version supported by Electron 33.x.
+  minimumSystemVersion: "10.15"
+
+win:
+  target:
+    - target: nsis
+      arch: x64
+
+# Skip DMG code signing (no Apple Developer account).
+# Mac users will need to right-click -> Open on first launch.
+dmg:
+  sign: false
+  # Simple layout: app icon on the left, Applications alias on the right.
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowToChangeInstallationDirectory: false
+  deleteAppDataOnUninstall: false
