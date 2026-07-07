@@ -4,6 +4,10 @@ copyright: Copyright 2026
 directories:
   output: dist
 
+# Disable electron-builder auto-publishing. We create the GitHub Release manually
+# in the workflow so we don't need a GH_TOKEN here.
+publish: null
+
 # Keep the default file inclusion (package.json, source files, production node_modules)
 # and remove development / test helpers that are not needed at runtime.
 files:
