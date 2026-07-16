@@ -50,6 +50,33 @@ function getTranscriptionData(projectFolder) {
     return loadJson(p);
 }
 
+function getPrecomputedAlignment(projectFolder, sectionId, scriptData) {
+    if (!scriptData) scriptData = getScriptData(projectFolder);
+    const sectionData = (scriptData && scriptData.sections || {})[sectionId] || {};
+    if (sectionData.timestamp_map && Object.keys(sectionData.timestamp_map).length) {
+        return {
+            timestampMap: sectionData.timestamp_map,
+            scriptStartTime: sectionData.script_start_time || 0
+        };
+    }
+
+    const p = path.join(projectFolder, 'qc', 'alignment.json');
+    if (!fs.existsSync(p)) return null;
+    try {
+        const alignmentData = loadJson(p);
+        const sec = (alignmentData.sections || {})[sectionId] || {};
+        if (sec.timestamp_map && Object.keys(sec.timestamp_map).length) {
+            return {
+                timestampMap: sec.timestamp_map,
+                scriptStartTime: sec.script_start_time || 0
+            };
+        }
+    } catch (e) {
+        console.error('Error reading alignment.json:', e);
+    }
+    return null;
+}
+
 function getAudioFile(projectFolder, sectionId) {
     const audioDir = path.join(projectFolder, 'audio');
     if (!fs.existsSync(audioDir)) return null;
@@ -64,6 +91,12 @@ function getAudioFile(projectFolder, sectionId) {
         }
     }
     return null;
+}
+
+function getProjectPdfFile(projectFolder) {
+    const files = fs.readdirSync(projectFolder, { withFileTypes: true });
+    const pdf = files.find(entry => entry.isFile() && path.extname(entry.name).toLowerCase() === '.pdf');
+    return pdf ? path.join(projectFolder, pdf.name) : null;
 }
 
 // ── WAV peaks generation (pure Node stdlib) ──────────────────────────────────
@@ -136,7 +169,16 @@ function generatePeaksFromWav(wavPath) {
 }
 
 // ── static UI ────────────────────────────────────────────────────────────────
-app.use(express.static(path.join(__dirname, 'ui')));
+// Prevent stale HTML/JS/CSS from being cached across app restarts.
+app.use(express.static(path.join(__dirname, 'ui'), {
+    setHeaders: (res, path) => {
+        if (path.endsWith('.html') || path.endsWith('.js') || path.endsWith('.css')) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Expires', '0');
+        }
+    }
+}));
 
 // ── project info ─────────────────────────────────────────────────────────────
 app.get('/api/project', (req, res) => {
@@ -145,8 +187,16 @@ app.get('/api/project', (req, res) => {
     const scriptData = getScriptData(PROJECT_FOLDER);
     const sections   = scriptData ? Object.keys(scriptData.sections || {}) : [];
     const name       = path.basename(PROJECT_FOLDER);
+    const pdfPath    = getProjectPdfFile(PROJECT_FOLDER);
 
-    res.json({ ok: true, name, sections, folder: PROJECT_FOLDER });
+    res.json({ ok: true, name, sections, folder: PROJECT_FOLDER, pdf_available: Boolean(pdfPath), pdf_name: pdfPath && path.basename(pdfPath) });
+});
+
+app.get('/api/pdf', (req, res) => {
+    if (!PROJECT_FOLDER) return res.status(400).send('No project');
+    const pdfPath = getProjectPdfFile(PROJECT_FOLDER);
+    if (!pdfPath) return res.status(404).send('No PDF found');
+    res.type('application/pdf').sendFile(pdfPath);
 });
 
 // ── section script + alignment ────────────────────────────────────────────────
@@ -181,7 +231,16 @@ app.get('/api/section/:sectionId/script', (req, res) => {
     if (transcData) {
         const secTrans = (transcData.sections || {})[sectionId] || {};
         transcriptionWords = secTrans.words || [];
-        if (transcriptionWords.length && scriptTokens.length) {
+
+        // 1. Prefer precomputed alignment from the QC package
+        const precomputed = getPrecomputedAlignment(PROJECT_FOLDER, sectionId, scriptData);
+        if (precomputed && transcriptionWords.length) {
+            timestampMap = precomputed.timestampMap;
+            scriptStartTime = precomputed.scriptStartTime;
+        }
+
+        // 2. Fallback to on-the-fly alignment
+        if (!Object.keys(timestampMap).length && transcriptionWords.length && scriptTokens.length) {
             try {
                 const result = progressiveAnchorAlignment(scriptTokens, transcriptionWords);
                 timestampMap    = result.timestampMap;
@@ -264,7 +323,7 @@ function ensureSession(projectFolder) {
     const sessPath   = path.join(qcDir, 'session.json');
     if (!fs.existsSync(sessPath)) {
         fs.mkdirSync(qcDir, { recursive: true });
-        saveJson(sessPath, { last_section: null, last_time: 0, markers: [] });
+        saveJson(sessPath, { last_section: null, last_time: 0, markers: [], script_zoom: 14 });
     }
     return sessPath;
 }
@@ -320,6 +379,16 @@ app.post('/api/session/marker/update', (req, res) => {
     res.json({ ok: true, marker });
 });
 
+app.post('/api/session/zoom', (req, res) => {
+    if (!PROJECT_FOLDER) return res.status(400).json({ ok: false });
+    const { script_zoom } = req.body;
+    const sessPath = ensureSession(PROJECT_FOLDER);
+    const sess = loadJson(sessPath);
+    sess.script_zoom = script_zoom;
+    saveJson(sessPath, sess);
+    res.json({ ok: true });
+});
+
 // ── L2 ticket CRUD ────────────────────────────────────────────────────────────
 app.get('/api/l2', (req, res) => {
     if (!PROJECT_FOLDER) return res.json({ ok: false });
@@ -334,7 +403,7 @@ app.post('/api/l2/ticket/add', (req, res) => {
     const l2 = loadJson(l2Path);
 
     if (!l2.sections[section_id]) {
-        l2.sections[section_id] = { decision: 'pending', confidence: null, tickets: [], manual_tickets: [] };
+        l2.sections[section_id] = { confidence: null, tickets: [], manual_tickets: [] };
     }
 
     if (!ticket.ticket_id) {
@@ -384,27 +453,13 @@ app.post('/api/l2/ticket/remove', (req, res) => {
     res.json({ ok: true });
 });
 
-// ── section decision ──────────────────────────────────────────────────────────
-app.post('/api/l2/section/decision', (req, res) => {
-    if (!PROJECT_FOLDER) return res.status(400).json({ ok: false });
-    const { section_id, decision } = req.body;
-    const l2Path = ensureL2(PROJECT_FOLDER);
-    const l2 = loadJson(l2Path);
-
-    if (!l2.sections[section_id]) {
-        l2.sections[section_id] = { decision: 'pending', confidence: null, tickets: [], manual_tickets: [] };
-    }
-    l2.sections[section_id].decision = decision;
-    saveJson(l2Path, l2);
-    res.json({ ok: true });
-});
-
 // ── Excel report export ─────────────────────────────────────────────────────
 app.get('/api/export/report', async (req, res) => {
     if (!PROJECT_FOLDER) return res.status(400).json({ ok: false, error: 'No project loaded' });
 
     try {
-        const { buffer, projectName, ticketCount } = await generateExcelReport(PROJECT_FOLDER);
+        const qcerName = String(req.query.qcer || '').trim();
+        const { buffer, projectName, ticketCount } = await generateExcelReport(PROJECT_FOLDER, qcerName);
         const filename = `${projectName}_QC_Report.xlsx`;
 
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

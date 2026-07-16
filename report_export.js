@@ -3,6 +3,7 @@
 const path  = require('path');
 const fs    = require('fs');
 const ExcelJS = require('exceljs');
+const { normalizeTextToken, progressiveAnchorAlignment } = require('./alignment');
 
 const TEMPLATE_PATH = path.join(__dirname, 'report_templates', 'qc_full_report_template.xlsx');
 const FULL_QC_SHEET = 'Full QC report';
@@ -92,6 +93,97 @@ function getL2(projectFolder) {
     try { return loadJson(l2Path); } catch { return { sections: {} }; }
 }
 
+function getTranscriptionData(projectFolder) {
+    const p = path.join(projectFolder, 'qc', 'transcription.json');
+    if (!fs.existsSync(p)) return { sections: {} };
+    try { return loadJson(p); } catch { return { sections: {} }; }
+}
+
+// ── derive the PDF page for a ticket from the section's alignment ───────────
+function getPageFromBoundaries(tokenIndex, pageBoundaries) {
+    if (!pageBoundaries || typeof pageBoundaries !== 'object') return null;
+    let bestPage = null;
+    let bestStart = -1;
+    for (const [pageStr, startIdx] of Object.entries(pageBoundaries)) {
+        const page  = parseInt(pageStr, 10);
+        const start = parseInt(startIdx, 10);
+        if (isNaN(page) || isNaN(start)) continue;
+        if (start <= tokenIndex && start > bestStart) {
+            bestStart = start;
+            bestPage = page;
+        }
+    }
+    return bestPage;
+}
+
+function getPageFromToken(token, pageBoundaries, tokenIndex) {
+    if (!token) return null;
+    if (token.pdf_page) return String(token.pdf_page);
+    if (pageBoundaries && Object.keys(pageBoundaries).length) {
+        const idx = token.index !== undefined ? token.index : tokenIndex;
+        const page = getPageFromBoundaries(idx, pageBoundaries);
+        if (page !== null) return String(page);
+    }
+    return null;
+}
+
+function getTicketPage(ticket, sectionData, transcWords) {
+    const start = ticketStart(ticket);
+    const tokens = (sectionData && sectionData.tokens) || [];
+    const pageBoundaries = (sectionData && sectionData.page_boundaries) || {};
+    if (!tokens.length) return (ticket.page || '').toString().trim() || 'N/A';
+
+    // First/last PDF pages present in the script tokens or page_boundaries
+    let firstPage = null;
+    let lastPage = null;
+    for (let i = 0; i < tokens.length; i++) {
+        const p = getPageFromToken(tokens[i], pageBoundaries, i);
+        if (p !== null) {
+            if (firstPage === null) firstPage = p;
+            lastPage = p;
+        }
+    }
+    if (!firstPage) return (ticket.page || '').toString().trim() || 'N/A';
+
+    let bestPage = firstPage;
+
+    if (!transcWords || !transcWords.length) {
+        return (ticket.page || '').toString().trim() || firstPage;
+    }
+
+    // Compute alignment on the fly for this section
+    const scriptTokens = tokens.map(t => normalizeTextToken(t.raw || ''));
+    let timestampMap;
+    try {
+        const result = progressiveAnchorAlignment(scriptTokens, transcWords);
+        timestampMap = result.timestampMap;
+    } catch (e) {
+        return (ticket.page || '').toString().trim() || firstPage;
+    }
+
+    // Collect aligned script tokens with their spoken-word times
+    const aligned = [];
+    for (let i = 0; i < tokens.length; i++) {
+        const wi = timestampMap[i];
+        if (wi === undefined || !transcWords[wi]) continue;
+        aligned.push({ i, start: transcWords[wi].start });
+    }
+    if (!aligned.length) return bestPage;
+
+    if (start < aligned[0].start) return firstPage;
+    if (start > aligned[aligned.length - 1].start) {
+        return getPageFromToken(tokens[aligned[aligned.length - 1].i], pageBoundaries, aligned[aligned.length - 1].i) || lastPage || firstPage;
+    }
+
+    for (const a of aligned) {
+        if (a.start <= start) {
+            const p = getPageFromToken(tokens[a.i], pageBoundaries, a.i);
+            if (p !== null) bestPage = p;
+        }
+    }
+    return bestPage;
+}
+
 // ── derive section number string ("001") from section_id ("sec_001") ─────────
 function sectionNumber(sectionId) {
     const num = sectionId.replace(/^sec_/i, '');
@@ -116,6 +208,14 @@ function buildRows(projectFolder) {
     const l2     = getL2(projectFolder);
     const script = getProjectMeta(projectFolder);
     const scriptSections = script.sections || {};
+    const transcription = getTranscriptionData(projectFolder);
+
+    // Cache alignments per section (some sections have many tickets)
+    const alignmentCache = {};
+    function getSectionWords(secId) {
+        const secTrans = (transcription.sections || {})[secId] || {};
+        return secTrans.words || null;
+    }
 
     // Sort section IDs by their numeric value
     const sectionIds = Object.keys(l2.sections || {}).sort((a, b) => {
@@ -129,6 +229,7 @@ function buildRows(projectFolder) {
         const sec     = l2.sections[secId] || {};
         const wavNum  = sectionNumber(secId);
         const secName = sectionName(secId, scriptSections[secId]);
+        const transcWords = getSectionWords(secId);
 
         // Combine auto-detected tickets and manually created tickets
         const allTickets = [
@@ -137,10 +238,11 @@ function buildRows(projectFolder) {
         ].sort((a, b) => ticketStart(a) - ticketStart(b));
 
         for (const t of allTickets) {
+            const page = getTicketPage(t, scriptSections[secId], transcWords);
             rows.push({
                 wav_number:   wavNum,
                 section_name: secName,
-                page:         (t.page || '').toString().trim() || 'N/A',
+                page:         page || 'N/A',
                 start_seconds: ticketStart(t),
                 type_code:    mapType(t.type || t.ticket_type),
                 comment:      (t.comment || t.note || '').trim(),
@@ -155,7 +257,7 @@ function buildRows(projectFolder) {
 }
 
 // ── main export function ──────────────────────────────────────────────────────
-async function generateExcelReport(projectFolder) {
+async function generateExcelReport(projectFolder, qcerName = '') {
     if (!fs.existsSync(TEMPLATE_PATH)) {
         throw new Error(`Excel template not found at: ${TEMPLATE_PATH}`);
     }
@@ -171,9 +273,21 @@ async function generateExcelReport(projectFolder) {
         throw new Error(`Template is missing the "${FULL_QC_SHEET}" sheet`);
     }
 
+    // The template's conditional formatting for the Severity column applies
+    // strikethrough to every severity label. The report should show normal text,
+    // so we remove the strikethrough effect while preserving any colour fills.
+    for (const cf of ws.conditionalFormattings || []) {
+        for (const rule of cf.rules || []) {
+            if (rule.style && rule.style.font) {
+                rule.style.font.strike = false;
+            }
+        }
+    }
+
     // Keep all template sheets intact (including any dropdown/source sheets).
 
     // Fill header cells
+    ws.getCell('C2').value = qcerName;   // Name of QC'er (adjacent to template label in B2)
     ws.getCell('C3').value = new Date(); // date of report (template format will display it)
 
     // Helper: set only the value, preserving existing template formatting

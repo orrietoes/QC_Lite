@@ -6,11 +6,18 @@ const S = {
     projectName:    null,
     sections:       [],
     currentSection: null,
+    pdfAvailable:   false,
+    pdfName:        null,
+    pdfPage:        null,
     l2:             null,
     // alignment
     timestampMap:      {},   // scriptIndex → spokenIndex  (from server)
     reverseMap:        {},   // spokenIndex → scriptIndex  (built once on section load)
     transcWords:       [],   // [{word, start, end}]
+    // script data (used for reliable PDF page lookups)
+    tokens:            [],   // [{raw, pdf_page, ...}] or [{raw, index}]
+    pageBoundaries:  {},   // {pageNumber: startTokenIndex}
+    sectionScripts:  {},   // sectionId -> {tokens, timestampMap, transcWords, scriptSpans, pageBoundaries}
     // DOM
     scriptSpans:       [],
     // highlight
@@ -24,9 +31,12 @@ const S = {
     // session / markers
     session:  { last_section: null, last_time: 0, markers: [] },
     markers:  [],   // markers for the current section (filtered from session.markers)
+    // zoom
+    scriptZoom: 14,  // current font size in pixels (default 14px)
 };
 
 const audio = document.getElementById('audio');
+let lastAutoComment = '';
 
 /* ═══════════════════════════════════════════════════════════════
    WAVEFORM  (matching original L2new2.html exactly)
@@ -372,6 +382,7 @@ function fmtAudioTime(s) {
 
 audio.addEventListener('timeupdate', () => {
     timeDisp.textContent = `${fmtAudioTime(audio.currentTime)} / ${fmtAudioTime(audio.duration)}`;
+    updatePdfReference();
 });
 audio.addEventListener('loadedmetadata', () => {
     timeDisp.textContent = `0:00 / ${fmtAudioTime(audio.duration)}`;
@@ -479,7 +490,14 @@ async function loadSession() {
     const r = await apiFetch('/api/session');
     if (!r.ok || !r.session) return;
     S.session = r.session;
-    const { last_section, last_time } = r.session;
+    const { last_section, last_time, script_zoom } = r.session;
+    
+    // Load and apply script zoom level
+    if (script_zoom) {
+        S.scriptZoom = script_zoom;
+        applyZoom();
+    }
+    
     if (last_section && S.sections.includes(last_section) && (last_time > 5 || last_section !== S.sections[0])) {
         const banner = document.getElementById('resume-banner');
         document.getElementById('resume-msg').textContent =
@@ -675,13 +693,16 @@ document.getElementById('export-btn').addEventListener('click', exportExcelRepor
 
 async function exportExcelReport() {
     if (!S.projectName) { alert('Open a project first.'); return; }
+    const qcerName = (localStorage.getItem('qcerName') || '').trim();
+    if (!qcerName) { alert('Please set your name first.'); showLogin(); return; }
+
     const exportBtn = document.getElementById('export-btn');
     const originalText = exportBtn.textContent;
     exportBtn.textContent = 'Exporting…';
     exportBtn.disabled = true;
 
     try {
-        const res = await fetch('/api/export/report');
+        const res = await fetch('/api/export/report?qcer=' + encodeURIComponent(qcerName));
         if (!res.ok) {
             const err = await res.json().catch(() => ({ error: 'Export failed' }));
             alert('Export failed: ' + err.error);
@@ -717,8 +738,16 @@ async function loadProject() {
 
     S.projectName = data.name;
     S.sections    = data.sections;
-    document.getElementById('project-name').textContent = data.name;
+    S.pdfAvailable = Boolean(data.pdf_available);
+    S.pdfName = data.pdf_name || null;
+    S.pdfPage = null;
+    S.sectionScripts = {};  // clear per-project section cache
+    S.pageBoundaries = {};   // current section page boundaries
+    const projectNameEl = document.getElementById('project-name');
+    projectNameEl.textContent = data.name;
+    projectNameEl.classList.add('loaded');
     document.getElementById('export-btn').disabled = false;
+    document.getElementById('all-tickets-btn').disabled = false;
 
     const sel = document.getElementById('section-select');
     sel.innerHTML = '';
@@ -756,6 +785,18 @@ async function loadSection(sectionId) {
         });
     }
 
+    // cache the current section's script data so the all-tickets panel can
+    // recompute pages for any section the user has already loaded.
+    if (S.currentSection) {
+        S.sectionScripts[S.currentSection] = {
+            tokens:         S.tokens,
+            timestampMap:   S.timestampMap,
+            transcWords:    S.transcWords,
+            scriptSpans:    S.scriptSpans,
+            pageBoundaries: S.pageBoundaries
+        };
+    }
+
     S.currentSection    = sectionId;
     S.currentHighlight  = -1;
     S.scriptSpans       = [];
@@ -776,8 +817,19 @@ async function loadSection(sectionId) {
         S.timestampMap = data.timestamp_map || {};
         S.reverseMap   = buildReverseMap(S.timestampMap);
         S.transcWords  = data.transcription_words || [];
+        S.tokens       = data.tokens || [];
+        S.pageBoundaries = data.page_boundaries || {};
 
         renderScript(data);
+
+        // Cache the section we just loaded so the all-tickets panel can recompute pages.
+        S.sectionScripts[sectionId] = {
+            tokens:         S.tokens,
+            timestampMap:   S.timestampMap,
+            transcWords:    S.transcWords,
+            scriptSpans:    S.scriptSpans,
+            pageBoundaries: S.pageBoundaries
+        };
 
         // Load audio
         if (data.audio_filename) {
@@ -787,7 +839,6 @@ async function loadSection(sectionId) {
         }
 
         renderTickets();
-        updateSectionStatus();
         refreshSectionMarkers();
         renderFrame();
     } catch (e) {
@@ -851,23 +902,22 @@ function renderScript(data) {
 
     const tokens = (Array.isArray(data.tokens) && data.tokens.length) ? data.tokens : null;
     const words  = tokens ? tokens.map(t => t.raw || '') : (data.script || '').split(/\s+/);
+    const pageBoundaries = data.page_boundaries || {};
 
     let lastPage = null;
     words.forEach((word, i) => {
-        if (tokens && tokens[i] && tokens[i].pdf_page) {
-            const page = tokens[i].pdf_page;
-            if (page !== lastPage) {
-                const pm = document.createElement('span');
-                pm.className = 'page-marker';
-                pm.textContent = `— Page ${page} —`;
-                container.appendChild(pm);
-                lastPage = page;
-            }
+        const page = getPageFromToken(tokens ? tokens[i] : null, pageBoundaries, i);
+        if (page !== null && page !== lastPage) {
+            const pm = document.createElement('span');
+            pm.className = 'page-marker';
+            pm.textContent = `— Page ${page} —`;
+            container.appendChild(pm);
+            lastPage = page;
         }
         const span = document.createElement('span');
         span.className   = 'token';
         span.dataset.idx = i;
-        if (tokens && tokens[i] && tokens[i].pdf_page) span.dataset.page = tokens[i].pdf_page;
+        if (page !== null) span.dataset.page = page;
         span.textContent = word + ' ';
 
         // click → seek
@@ -883,6 +933,10 @@ function renderScript(data) {
         container.appendChild(span);
         S.scriptSpans.push(span);
     });
+    
+    // Apply current zoom level
+    applyZoom();
+    updatePdfReference();
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -938,20 +992,134 @@ function getAudioSelectionTimes() {
 }
 
 // ── page helper ───────────────────────────────────────────────
-function getPageAtTime(time) {
-    let bestPage = '1';
-    (S.scriptSpans || []).forEach((span, i) => {
-        const wi = S.timestampMap ? S.timestampMap[i] : undefined;
-        if (wi === undefined || !(S.transcWords || [])[wi]) return;
-        if (S.transcWords[wi].start > time) return;
-        if (span.dataset.page) bestPage = span.dataset.page;
-    });
+function getPageFromBoundaries(tokenIndex, pageBoundaries) {
+    if (!pageBoundaries || typeof pageBoundaries !== 'object') return null;
+    let bestPage = null;
+    let bestStart = -1;
+    for (const [pageStr, startIdx] of Object.entries(pageBoundaries)) {
+        const page  = parseInt(pageStr, 10);
+        const start = parseInt(startIdx, 10);
+        if (isNaN(page) || isNaN(start)) continue;
+        if (start <= tokenIndex && start > bestStart) {
+            bestStart = start;
+            bestPage = page;
+        }
+    }
+    return bestPage;
+}
+
+function getPageFromToken(token, pageBoundaries, tokenIndex) {
+    if (!token) return null;
+    // Old format: token has pdf_page directly.
+    if (token.pdf_page) return String(token.pdf_page);
+    // New format: token has an index and section has page_boundaries {page: startIndex}.
+    if (pageBoundaries && Object.keys(pageBoundaries).length) {
+        const idx = token.index !== undefined ? token.index : tokenIndex;
+        const page = getPageFromBoundaries(idx, pageBoundaries);
+        if (page !== null) return String(page);
+    }
+    return null;
+}
+
+function getPageAtTime(time, scriptData = null) {
+    time = parseFloat(time) || 0;
+    const sd = scriptData || S;
+    const tokens = sd.tokens || [];
+    const spans  = sd.scriptSpans || [];
+    const timestampMap = sd.timestampMap || {};
+    const transcWords  = sd.transcWords || [];
+    const pageBoundaries = sd.pageBoundaries || {};
+
+    // Determine the first/last PDF page from the source tokens or rendered spans.
+    let firstPage = null;
+    let lastPage  = null;
+    for (let i = 0; i < tokens.length; i++) {
+        const p = getPageFromToken(tokens[i], pageBoundaries, i);
+        if (p !== null) {
+            if (firstPage === null) firstPage = p;
+            lastPage = p;
+        }
+    }
+    if (firstPage === null) {
+        for (const span of spans) {
+            if (span.dataset.page) {
+                const p = span.dataset.page;
+                if (firstPage === null) firstPage = p;
+                lastPage = p;
+            }
+        }
+    }
+
+    // Default to the first script PDF page, not hardcoded 1, so tickets in the
+    // pre-script intro still report the correct PDF page.
+    let bestPage = firstPage || '1';
+
+    // Collect aligned script tokens with their spoken-word times.
+    const aligned = [];
+    const tokenCount = tokens.length || spans.length;
+    for (let i = 0; i < tokenCount; i++) {
+        const wi = timestampMap[i];
+        if (wi === undefined || !transcWords[wi]) continue;
+        aligned.push({ i, wi, start: transcWords[wi].start });
+    }
+    if (!aligned.length) return bestPage;
+
+    // Ensure we search by chronological order, not script-index order.
+    aligned.sort((a, b) => a.start - b.start);
+
+    // Before the first aligned word -> first page; after the last -> last page.
+    if (time < aligned[0].start) return firstPage || '1';
+    if (time > aligned[aligned.length - 1].start) {
+        const lastIndex = aligned[aligned.length - 1].i;
+        const pageFromToken = getPageFromToken(tokens[lastIndex], pageBoundaries, lastIndex);
+        return pageFromToken || (spans[lastIndex] && spans[lastIndex].dataset.page) || lastPage || '1';
+    }
+
+    // In the aligned range: keep the page of the last aligned word at or before time.
+    for (const a of aligned) {
+        if (a.start <= time) {
+            const pageFromToken = getPageFromToken(tokens[a.i], pageBoundaries, a.i);
+            if (pageFromToken) bestPage = pageFromToken;
+            else if (spans[a.i] && spans[a.i].dataset.page) bestPage = spans[a.i].dataset.page;
+        }
+    }
     return bestPage;
 }
 
 function getCurrentPage() {
     return getPageAtTime(audio.currentTime);
 }
+
+function updatePdfReference(force = false) {
+    const button = document.getElementById('view-pdf-btn');
+    const panel = document.getElementById('pdf-panel');
+    const title = document.getElementById('pdf-title');
+    if (!S.pdfAvailable) {
+        button.disabled = true;
+        button.textContent = 'View PDF';
+        title.textContent = 'Reference PDF unavailable';
+        return;
+    }
+
+    const page = getCurrentPage();
+    button.disabled = false;
+    button.textContent = `View PDF · p${page}`;
+    title.textContent = `${S.pdfName || 'Reference PDF'} · Page ${page}`;
+    if (!panel.classList.contains('open') || (!force && S.pdfPage === page)) return;
+
+    S.pdfPage = page;
+    document.getElementById('pdf-frame').src = `/api/pdf#page=${encodeURIComponent(page)}`;
+}
+
+document.getElementById('view-pdf-btn').addEventListener('click', () => {
+    const panel = document.getElementById('pdf-panel');
+    panel.classList.toggle('open');
+    updatePdfReference(true);
+});
+
+document.getElementById('pdf-close-btn').addEventListener('click', () => {
+    document.getElementById('pdf-panel').classList.remove('open');
+});
 
 // ── script context helper ─────────────────────────────────────
 function getScriptContextAroundTime(time) {
@@ -998,16 +1166,18 @@ function generateAutoComment(type, spoken, expected) {
     const sp = (spoken   || '').trim();
     const ex = (expected || '').trim();
     const t  = (type     || 'OTHER').toUpperCase();
-    if (t === 'MISREAD'        && sp && ex) return `Misread '${ex}' as '${sp}'`;
-    if (t === 'MISSING_WORD'   && ex)       return `Missing word '${ex}'`;
-    if (t === 'MISSING_LINE'   && ex)       return `Missing line '${ex}'`;
-    if (t === 'REPEATED_WORD'  && sp)       return `Repeated word '${sp}'`;
-    if (t === 'REPEATED_LINE'  && sp)       return `Repeated line '${sp}'`;
-    if (t === 'PRONUNCIATION'  && sp)       return `Pronunciation issue with '${sp}'`;
-    if (t === 'NOISE')                      return 'Noise issue';
-    if (t === 'PLOSIVE')                    return 'Plosive issue';
-    if (t === 'DISTORTION')                 return 'Distortion issue';
-    if (sp || ex) return `${t} - ${sp || ex}`;
+
+    // A misread is the only error type that is defined by both what was said
+    // and what should have been said.
+    if (sp && ex && (t === 'MISREAD' || t === 'OTHER')) return `misread - '${ex}' as '${sp}'`;
+    if (t === 'MISSING_WORD'   && ex)       return `missing word '${ex}'`;
+    if (t === 'MISSING_LINE'   && ex)       return `missing line '${ex}'`;
+    if (t === 'REPEATED_WORD'  && sp)       return `repeated word '${sp}'`;
+    if (t === 'REPEATED_LINE'  && sp)       return `repeated line '${sp}'`;
+    if (t === 'PRONUNCIATION'  && sp)       return `pronunciation issue with '${sp}'`;
+    if (t === 'NOISE')                      return 'noise issue';
+    if (t === 'PLOSIVE')                    return 'plosive issue';
+    if (t === 'DISTORTION')                 return 'distortion issue';
     return '';
 }
 
@@ -1040,7 +1210,10 @@ function renderTickets() {
         const end   = getTicketEnd(t);
         const note  = (t.comment || t.note || '').trim();
 
-        const pageLabel = t.page ? `<span class="tc-page">Page ${escHtml(t.page)}</span>` : '';
+        // Recompute the PDF page from the current section's alignment so tickets
+        // created before the page fix display the correct page number.
+        const page = getPageAtTime(parseFloat(start) || 0);
+        const pageLabel = page ? `<span class="tc-page">Page ${escHtml(page)}</span>` : '';
         card.innerHTML = `
           <div class="tc-header">
             <span class="tc-type tc-${type.toLowerCase()}">${type}</span>
@@ -1101,14 +1274,6 @@ function selectTicket(ticket, cardEl) {
     if (ticketSpans.length) ticketSpans[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
-function updateSectionStatus() {
-    const sec      = S.l2 && S.currentSection ? S.l2.sections[S.currentSection] : null;
-    const decision = sec ? (sec.decision || 'pending') : 'pending';
-    const el       = document.getElementById('section-status');
-    el.className   = `st-${decision}`;
-    el.textContent = decision.charAt(0).toUpperCase() + decision.slice(1);
-}
-
 // ── sidebar helpers ───────────────────────────────────────────
 function openSidebar() {
     document.getElementById('ticket-details-panel').classList.add('open');
@@ -1161,6 +1326,7 @@ function openNewTicket() {
     document.getElementById('td-section-id').value           = S.currentSection;
     document.getElementById('td-save').textContent           = 'Create Ticket';
     document.getElementById('td-delete').style.display      = 'none';
+    lastAutoComment = '';
     openSidebar();
     // don't steal focus — user keeps keyboard control (Space = play/pause)
 }
@@ -1189,11 +1355,14 @@ function openTicketDetails(ticket) {
     document.getElementById('td-start').value            = formatTime(start);
     document.getElementById('td-end').value              = formatTime(end);
     document.getElementById('td-script').value           = ticket.script || getScriptContextAroundTime(start);
-    document.getElementById('td-page').value             = ticket.page   || getPageAtTime(start);
+    // Recompute the PDF page from the current section's alignment so old tickets
+    // that were saved with a wrong page are corrected when opened.
+    document.getElementById('td-page').value             = getPageAtTime(start);
     document.getElementById('td-ticket-id').value        = ticket.ticket_id;
     document.getElementById('td-section-id').value       = ticket.section_id || S.currentSection;
     document.getElementById('td-save').textContent       = 'Update Ticket';
     document.getElementById('td-delete').style.display  = 'block';
+    lastAutoComment = '';
     openSidebar();
 }
 
@@ -1223,6 +1392,7 @@ function gatherTicketFields() {
 // ── save ticket ───────────────────────────────────────────────
 async function saveTicket() {
     if (!S.currentSection) return;
+    updateAutoComment();
     const fields = gatherTicketFields();
 
     if (S.editingTicketId) {
@@ -1245,7 +1415,7 @@ async function saveTicket() {
         });
         if (r.ok) {
             if (!S.l2.sections[S.currentSection])
-                S.l2.sections[S.currentSection] = { decision: 'pending', confidence: null, tickets: [], manual_tickets: [] };
+                S.l2.sections[S.currentSection] = { confidence: null, tickets: [], manual_tickets: [] };
             S.l2.sections[S.currentSection].manual_tickets.push(r.ticket || ticket);
         }
     }
@@ -1273,6 +1443,8 @@ function useCurrentScriptSelection() {
     if (!sel.text.includes(' ') && !document.getElementById('td-spoken').value.trim())
         document.getElementById('td-spoken').value = sel.text;
 
+    updateAutoComment();
+
     // Update timestamps + waveform selection if alignment info is available
     if (sel.startTime !== null) {
         document.getElementById('td-start').value = formatTime(sel.startTime);
@@ -1290,14 +1462,24 @@ function useCurrentScriptSelection() {
 
 // ── auto comment ──────────────────────────────────────────────
 function updateAutoComment() {
+    const typeEl  = document.getElementById('td-type');
     const comment = document.getElementById('td-comment');
-    if (!comment || comment.value.trim() !== '') return;
-    const auto = generateAutoComment(
-        document.getElementById('td-type').value,
-        document.getElementById('td-spoken').value,
-        document.getElementById('td-expected').value
-    );
-    if (auto) comment.value = auto;
+    if (!typeEl || !comment) return;
+
+    const spoken   = document.getElementById('td-spoken').value;
+    const expected = document.getElementById('td-expected').value;
+    const sp = (spoken   || '').trim();
+    const ex = (expected || '').trim();
+
+    // If both spoken and expected are provided, the error is a misread.
+    if (sp && ex && typeEl.value === 'OTHER') typeEl.value = 'MISREAD';
+
+    const auto    = generateAutoComment(typeEl.value, spoken, expected);
+    const current = comment.value.trim();
+    if (!current || current === lastAutoComment) {
+        comment.value = auto;
+        lastAutoComment = auto;
+    }
 }
 
 // ── delete ticket ─────────────────────────────────────────────
@@ -1326,8 +1508,8 @@ document.getElementById('td-update-time').addEventListener('click', updateTimest
 document.getElementById('td-use-script').addEventListener('click', useCurrentScriptSelection);
 document.getElementById('td-delete').addEventListener('click', () => { if (S.editingTicketId) deleteTicket(S.editingTicketId); });
 document.getElementById('td-type').addEventListener('change', updateAutoComment);
-document.getElementById('td-spoken').addEventListener('input', updateAutoComment);
-document.getElementById('td-expected').addEventListener('input', updateAutoComment);
+document.getElementById('td-spoken').addEventListener('change', updateAutoComment);
+document.getElementById('td-expected').addEventListener('change', updateAutoComment);
 document.getElementById('td-close-btn').addEventListener('click', closeTicketDetails);
 document.getElementById('td-overlay').addEventListener('click', closeTicketDetails);
 
@@ -1352,23 +1534,119 @@ function jumpToTicket(dir) {
     if (cardEl) cardEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
-// ── decisions ─────────────────────────────────────────────────
-document.getElementById('approve-btn').addEventListener('click', () => setDecision('approved'));
-document.getElementById('reject-btn').addEventListener('click',  () => setDecision('rejected'));
-
-async function setDecision(decision) {
-    const r = await apiFetch('/api/l2/section/decision', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ section_id: S.currentSection, decision })
-    });
-    if (r.ok) {
-        if (!S.l2.sections[S.currentSection])
-            S.l2.sections[S.currentSection] = { decision, confidence: null, tickets: [], manual_tickets: [] };
-        else
-            S.l2.sections[S.currentSection].decision = decision;
-        updateSectionStatus();
+/* ═══════════════════════════════════════════════════════════════
+   ALL TICKETS  (project-wide list)
+═══════════════════════════════════════════════════════════════ */
+function getAllProjectTickets() {
+    if (!S.l2 || !S.l2.sections) return [];
+    const all = [];
+    for (const [sectionId, sec] of Object.entries(S.l2.sections)) {
+        if (!sec) continue;
+        for (const arr of [sec.tickets || [], sec.manual_tickets || []]) {
+            for (const t of arr) {
+                if (!t) continue;
+                const ticket = { ...t };
+                if (!ticket.section_id) ticket.section_id = sectionId;
+                all.push(ticket);
+            }
+        }
     }
+    return all.sort((a, b) => {
+        if (a.section_id !== b.section_id) return a.section_id.localeCompare(b.section_id);
+        return parseFloat(getTicketStart(a)) - parseFloat(getTicketStart(b));
+    });
 }
+
+function renderAllTicketsPanel() {
+    const list = document.getElementById('all-tickets-list');
+    list.innerHTML = '';
+    const tickets = getAllProjectTickets();
+    document.getElementById('at-count').textContent = tickets.length;
+
+    if (!tickets.length) {
+        list.innerHTML = '<div class="at-empty">No tickets found in this project.</div>';
+        return;
+    }
+
+    tickets.forEach(t => {
+        const type = normalizeTicketType(t.type || t.ticket_type);
+        const sev  = normalizeSeverity(t.severity);
+        const start = getTicketStart(t);
+        const end   = getTicketEnd(t);
+        const note  = (t.comment || t.note || '').trim();
+        // Recompute page from the section's cached script data if available; otherwise fall
+        // back to the stored value (which may be stale for tickets saved before the fix).
+        const cached = t.section_id && S.sectionScripts[t.section_id];
+        const page = cached
+            ? getPageAtTime(parseFloat(start) || 0, cached)
+            : (t.page || '');
+        const pageLabel = page ? `<span class="at-page">Page ${escHtml(page)}</span>` : '';
+        const color = TICKET_COLORS[type] || '#6b7280';
+        const row = document.createElement('div');
+        row.className = 'at-ticket';
+        row.dataset.tid = t.ticket_id;
+        row.dataset.sev = sev;
+        row.innerHTML = `
+          <div class="at-row">
+            <div class="at-meta">
+              <span class="at-section">${escHtml(fmtSection(t.section_id))}</span>
+              <span class="at-type" style="color:${color}">${type}</span>
+            </div>
+            <button class="at-go" title="Go to ticket">Go</button>
+          </div>
+          <div class="at-time">${pageLabel}${formatTime(start)} – ${formatTime(end)}</div>
+          ${note ? `<div class="at-note">${escHtml(note)}</div>` : ''}`;
+        row.addEventListener('click', e => {
+            if (e.target.closest('.at-go')) return;
+            goToTicket(t);
+        });
+        row.querySelector('.at-go').addEventListener('click', e => {
+            e.stopPropagation();
+            goToTicket(t);
+        });
+        list.appendChild(row);
+    });
+}
+
+function openAllTicketsPanel() {
+    if (!S.projectName) { alert('Open a project first.'); return; }
+    renderAllTicketsPanel();
+    document.getElementById('all-tickets-panel').classList.add('open');
+}
+
+function closeAllTicketsPanel() {
+    document.getElementById('all-tickets-panel').classList.remove('open');
+}
+
+function toggleAllTicketsPanel() {
+    const panel = document.getElementById('all-tickets-panel');
+    if (panel.classList.contains('open')) closeAllTicketsPanel();
+    else openAllTicketsPanel();
+}
+
+async function goToTicket(ticket) {
+    if (!ticket) return;
+    const sectionId = ticket.section_id || ticket._sectionId;
+    if (!sectionId) return;
+    if (sectionId !== S.currentSection) await loadSection(sectionId);
+    const sec = S.l2.sections[sectionId];
+    let t = null;
+    if (sec) {
+        for (const arr of [sec.tickets || [], sec.manual_tickets || []]) {
+            t = arr.find(x => x.ticket_id === ticket.ticket_id);
+            if (t) break;
+        }
+    }
+    if (!t) t = ticket;
+    if (!t.section_id) t.section_id = sectionId;
+    const cardEl = document.querySelector(`.ticket-card[data-tid="${t.ticket_id}"]`);
+    selectTicket(t, cardEl);
+    closeAllTicketsPanel();
+    if (cardEl) cardEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+document.getElementById('all-tickets-btn').addEventListener('click', openAllTicketsPanel);
+document.getElementById('at-close').addEventListener('click', closeAllTicketsPanel);
 
 /* ═══════════════════════════════════════════════════════════════
    SEARCH
@@ -1376,6 +1654,59 @@ async function setDecision(decision) {
 document.getElementById('search-btn').addEventListener('click', doSearch);
 document.getElementById('search-box').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 document.getElementById('search-next-btn').addEventListener('click', nextSearchResult);
+
+/* ═══════════════════════════════════════════════════════════════
+   ZOOM
+═══════════════════════════════════════════════════════════════ */
+const MIN_ZOOM = 10;
+const MAX_ZOOM = 32;
+const DEFAULT_ZOOM = 14;
+
+document.getElementById('zoom-in-btn').addEventListener('click', zoomIn);
+document.getElementById('zoom-out-btn').addEventListener('click', zoomOut);
+document.getElementById('zoom-reset-btn').addEventListener('click', resetZoom);
+
+function zoomIn() {
+    if (S.scriptZoom < MAX_ZOOM) {
+        S.scriptZoom = Math.min(S.scriptZoom + 2, MAX_ZOOM);
+        applyZoom();
+    }
+}
+
+function zoomOut() {
+    if (S.scriptZoom > MIN_ZOOM) {
+        S.scriptZoom = Math.max(S.scriptZoom - 2, MIN_ZOOM);
+        applyZoom();
+    }
+}
+
+function resetZoom() {
+    S.scriptZoom = DEFAULT_ZOOM;
+    applyZoom();
+}
+
+function applyZoom() {
+    const scriptContent = document.getElementById('script-content');
+    if (scriptContent) {
+        scriptContent.style.fontSize = S.scriptZoom + 'px';
+    }
+    updateZoomIndicator();
+    
+    // Persist zoom level to server
+    apiFetch('/api/session/zoom', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ script_zoom: S.scriptZoom })
+    });
+}
+
+function updateZoomIndicator() {
+    const zoomLevel = document.getElementById('zoom-level');
+    if (zoomLevel) {
+        const percentage = Math.round((S.scriptZoom / DEFAULT_ZOOM) * 100);
+        zoomLevel.textContent = percentage + '%';
+    }
+}
 
 function doSearch() {
     const q = document.getElementById('search-box').value.trim().toLowerCase();
@@ -1420,13 +1751,24 @@ document.addEventListener('keydown', e => {
     }
     if (e.key === 't' || e.key === 'T') { e.preventDefault(); openNewTicket(); }
     if (e.key === 'm' || e.key === 'M') { e.preventDefault(); addMarker(); }
+    if (e.key === 'a' || e.key === 'A') { e.preventDefault(); toggleAllTicketsPanel(); }
     if (e.key === ']') { e.preventDefault(); jumpToTicket('next'); }
     if (e.key === '[') { e.preventDefault(); jumpToTicket('prev'); }
     if (e.key === 'Delete' && S.selectedTicket) { e.preventDefault(); deleteTicket(S.selectedTicket.ticket_id); }
     if (e.key === 'ArrowLeft')  { e.preventDefault(); audio.currentTime = Math.max(0, audio.currentTime - 5); }
     if (e.key === 'ArrowRight') { e.preventDefault(); audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 5); }
+    
+    // Zoom shortcuts
+    if (e.ctrlKey || e.metaKey) {
+        if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomIn(); }
+        if (e.key === '-') { e.preventDefault(); zoomOut(); }
+        if (e.key === '0') { e.preventDefault(); resetZoom(); }
+    }
+    
     if (e.key === 'Escape') {
-        if (document.getElementById('ticket-details-panel').classList.contains('open')) {
+        if (document.getElementById('all-tickets-panel').classList.contains('open')) {
+            closeAllTicketsPanel();
+        } else if (document.getElementById('ticket-details-panel').classList.contains('open')) {
             closeTicketDetails();
         } else if (selection.active) {
             selection.active = false;
@@ -1450,3 +1792,48 @@ function showLoading(show) {
 function escHtml(str) {
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   QC'ER NAME / LOGIN
+═══════════════════════════════════════════════════════════════ */
+function updateQcerDisplay() {
+    const name = localStorage.getItem('qcerName') || '';
+    const display = document.getElementById('qcer-name');
+    const editBtn = document.getElementById('qcer-edit-btn');
+    if (display) display.textContent = name ? `QC'er: ${name}` : '';
+    if (editBtn) editBtn.textContent = name ? 'Change' : 'Set Name';
+}
+
+function showLogin() {
+    const overlay = document.getElementById('login-overlay');
+    const input = document.getElementById('login-name-input');
+    if (overlay) overlay.classList.remove('hidden');
+    if (input) input.value = localStorage.getItem('qcerName') || '';
+}
+
+function hideLogin() {
+    const overlay = document.getElementById('login-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+function saveLoginName() {
+    const input = document.getElementById('login-name-input');
+    const name = input ? input.value.trim() : '';
+    if (!name) return;
+    localStorage.setItem('qcerName', name);
+    if (input) input.value = '';
+    updateQcerDisplay();
+    hideLogin();
+}
+
+document.getElementById('login-save-btn').addEventListener('click', saveLoginName);
+document.getElementById('login-name-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') saveLoginName();
+});
+document.getElementById('qcer-edit-btn').addEventListener('click', showLogin);
+
+if (localStorage.getItem('qcerName')) {
+    updateQcerDisplay();
+    hideLogin();
+}
+console.log('[QC Lite] page helper v2 loaded — using token-based PDF page lookup');

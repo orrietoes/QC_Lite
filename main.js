@@ -15,6 +15,7 @@ async function createWindow() {
         minWidth: 900,
         minHeight: 600,
         title: 'QC Lite',
+        icon: path.join(__dirname, 'ui', 'assets', 'logo.png'),
         backgroundColor: '#1a1a2e',
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
